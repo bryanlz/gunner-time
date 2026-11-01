@@ -13,7 +13,9 @@ import argparse
 import html
 import json
 import logging
+import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,6 +26,7 @@ ARSENAL_ID = 9825
 SGT = timezone(timedelta(hours=8), "SGT")  # Singapore has no daylight saving, so a fixed offset is exact
 
 FOTMOB = "https://www.fotmob.com/api/data"
+COMMENTARY = "https://data.fotmob.com/webcl/ltc/gsm"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"}
 
@@ -31,8 +34,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 # GitHub's scheduled runs, which can start 10-30+ minutes late.
 LINEUP_WINDOW = timedelta(hours=3)       # start following a match this long before kickoff
 XG_WAIT_LIMIT = timedelta(minutes=30)    # after full time, wait at most this long for xG before sending anyway
-ASSIST_WAIT = timedelta(minutes=3)       # hold a goal alert this long for FotMob to add the assist (penalties and
-                                         # own goals have none, so they're sent straight away)
+GOAL_WAIT = timedelta(minutes=3)         # hold a goal alert this long for FotMob to add the assist and the
+                                         # commentary description, then send with whatever is known
 PREMATCH_POLL = 60                       # seconds between checks while waiting for the lineup
 LIVE_POLL = 30                           # seconds between checks during the match
 MAX_RUNTIME = int(5.5 * 3600)            # one run's limit; GitHub stops jobs at 6 hours
@@ -67,6 +70,17 @@ def fetch_fixtures():
 
 def fetch_match(match_id):
     return fetch_json("matchDetails", matchId=match_id)
+
+
+def fetch_commentary(match_id):
+    """FotMob's live text commentary events, or [] if it isn't available."""
+    try:
+        r = requests.get(f"{COMMENTARY}/{match_id}_en.json.gz", params={"_": int(time.time())},
+                         headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        return r.json().get("Events") or []
+    except (requests.RequestException, ValueError, AttributeError):
+        return []
 
 
 def parse_utc(s):
@@ -211,7 +225,68 @@ def goal_detail(e):
     return f" ({', '.join(bits)})" if bits else ""
 
 
-def fmt_goal(match, e):
+SHOT_TYPES = {"LeftFoot": "Left-footed finish", "RightFoot": "Right-footed finish", "Header": "Header"}
+SITUATIONS = {"RegularPlay": "open play", "FastBreak": "counter-attack", "SetPiece": "set piece",
+              "FromCorner": "from a corner", "FreeKick": "direct free kick", "Penalty": "penalty",
+              "ThrowInSetPiece": "from a throw-in"}
+
+
+def how_scored(e):
+    """One short line from FotMob's shot data, e.g. 'Left-footed finish from close range (5m) · open play · xG 0.63'."""
+    shot = e.get("shotmapEvent") or {}
+    if not shot:
+        return None
+    if shot.get("isOwnGoal") or e.get("ownGoal"):
+        return "Own goal"
+    situation = shot.get("situation")
+    if situation == "Penalty":
+        parts = ["Penalty"]
+    else:
+        parts = [SHOT_TYPES.get(shot.get("shotType"), "Finish")]
+        if shot.get("x") is not None and shot.get("y") is not None:
+            # FotMob's pitch is 105 x 68 with the goal centred at (105, 34)
+            dist = round(math.hypot(105 - shot["x"], 34 - shot["y"]))
+            where = ("from close range" if dist <= 6 else
+                     "from inside the box" if shot.get("isFromInsideBox") else "from outside the box")
+            parts[0] += f" {where} ({dist}m)"
+        if situation:
+            parts.append(SITUATIONS.get(situation, re.sub(r"(?<!^)(?=[A-Z])", " ", situation).lower()))
+    if shot.get("expectedGoals") is not None:
+        parts.append(f"xG {shot['expectedGoals']:.2f}")
+    return " · ".join(parts)
+
+
+def goal_commentary(events, e):
+    """The commentary line describing this goal, tidied, or None if it isn't there yet."""
+    scorer = (e.get("player") or {}).get("id")
+    for c in events:
+        if not str(c.get("IncidentCode", "")).upper().startswith(("G", "PG", "OG")) or c.get("IncidentCode") == "highlight":
+            continue
+        ids = [p.get("Id") for p in c.get("Players") or []]
+        if scorer in ids and abs((c.get("Elapsed") or 0) - (e.get("time") or 0)) <= 2:
+            return tidy_commentary(c.get("Description") or "")
+    return None
+
+
+def tidy_commentary(text):
+    """Drop shouty headlines ('FIRST BLOOD TO ARSENAL!!!') and the closing score recap, keep it brief."""
+    keep = []
+    for s in re.split(r"(?<=[.!?])\s+", text.strip()):
+        letters = [c for c in s if c.isalpha()]
+        if letters and sum(c.isupper() for c in letters) > 0.6 * len(letters):
+            continue
+        if re.match(r"^(It's|That's|And it's)\b.*\d+\s*-\s*\d+", s):
+            continue
+        keep.append(s)
+    out = ""
+    for s in keep:
+        if out and len(out) + len(s) > 350:
+            break
+        out = f"{out} {s}".strip()
+    return out or None
+
+
+def fmt_goal(match, e, description=None):
     scorer_team = team_name(match, e.get("isHome"))
     # For an own goal FotMob credits the team that benefited, so the headline still reads correctly
     arsenal = (teams(match)[0 if e.get("isHome") else 1]["id"] == ARSENAL_ID)
@@ -221,13 +296,20 @@ def fmt_goal(match, e):
     home, away = teams(match)
     score = (f"{esc(home['name'])} {new[0]}–{new[1]} {esc(away['name'])}"
              if len(new) == 2 else score_line(match))
-    return "\n".join([
+    lines = [
         head,
         f"{esc(e.get('nameStr') or (e.get('player') or {}).get('name'))} {minute(e)}{goal_detail(e)}",
         f"Assist: {esc(assist) if assist else 'none'}",
-        "",
-        f"<b>{score}</b>",
-    ])
+    ]
+    how = how_scored(e)
+    if how or description:
+        lines.append("")
+    if how:
+        lines.append(f"🎯 {esc(how)}")
+    if description:
+        lines.append(f"<i>{esc(description)}</i>")
+    lines += ["", f"<b>{score}</b>"]
+    return "\n".join(lines)
 
 
 def fmt_red(match, e):
@@ -349,14 +431,15 @@ def match_state(state, match_id):
 
 # ---------- Core logic ----------
 
-def assist_settled(e, ms, key, now, finished):
-    """True once a goal can be announced: its assist is known, it can't have one, or we've waited long enough."""
-    if e.get("assistInput") or e.get("ownGoal") or finished:
+def goal_ready(e, ms, key, now, finished, description):
+    """True once a goal can be announced: its assist and description are in, or we've waited long enough."""
+    if finished:
         return True
-    if (e.get("goalDescription") or "").lower() == "penalty":
+    no_assist_possible = e.get("ownGoal") or (e.get("goalDescription") or "").lower() == "penalty"
+    if (e.get("assistInput") or no_assist_possible) and description:
         return True
     first_seen = ms.setdefault("pending", {}).setdefault(key, now.isoformat())
-    return now - datetime.fromisoformat(first_seen) >= ASSIST_WAIT
+    return now - datetime.fromisoformat(first_seen) >= GOAL_WAIT
 
 
 def process_match(match, ms, now, dry_run=False):
@@ -380,15 +463,18 @@ def process_match(match, ms, now, dry_run=False):
     for e in red_cards(match):
         current[card_key(e)] = e
 
-    holding = False  # a goal is waiting for its assist; later goals wait too so alerts stay in order
+    commentary = None  # fetched at most once per check, and only when a goal needs describing
+
+    def describe(e):
+        nonlocal commentary
+        if commentary is None:
+            commentary = fetch_commentary(match["general"]["matchId"])
+        return goal_commentary(commentary, e)
+
+    holding = False  # a goal is waiting for its assist/description; later goals wait too so alerts stay in order
     for key, e in current.items():
         if key in ms["alerted"]:
             continue
-        if key.startswith("goal"):
-            settled = assist_settled(e, ms, key, now, status.get("finished"))
-            if holding or not settled:
-                holding = True
-                continue
         record = {"nameStr": e.get("nameStr"), "time": e.get("time"), "overloadTime": e.get("overloadTime"),
                   "isHome": e.get("isHome"), "player": (e.get("player") or {}).get("id"),
                   "newScore": e.get("newScore"), "assist": e.get("assistInput")}
@@ -403,12 +489,20 @@ def process_match(match, ms, now, dry_run=False):
             record["assist"] = old.get("assist")  # so the assist check below still notices a new assist
             ms["alerted"][key] = record
             continue
-        msg = fmt_goal(match, e) if key.startswith("goal") else fmt_red(match, e)
+        description = None
+        if key.startswith("goal"):
+            if holding:
+                continue
+            description = describe(e)
+            if not goal_ready(e, ms, key, now, status.get("finished"), description):
+                holding = True
+                continue
+        msg = fmt_goal(match, e, description) if key.startswith("goal") else fmt_red(match, e)
         if send(msg, dry_run):
             ms["alerted"][key] = record
     ms["pending"] = {k: v for k, v in ms.get("pending", {}).items() if k in current and k not in ms["alerted"]}
 
-    # Backup for an assist FotMob adds after ASSIST_WAIT has run out: send it as a follow-up
+    # Backup for an assist FotMob adds after GOAL_WAIT has run out: send it as a follow-up
     for key, e in current.items():
         record = ms["alerted"].get(key)
         assist = e.get("assistInput")
