@@ -239,6 +239,29 @@ def fmt_red(match, e):
     ])
 
 
+def is_half_time(match):
+    """True while the first half is over and the second hasn't started."""
+    status = match["header"]["status"]
+    halfs = status.get("halfs") or {}
+    if halfs.get("firstHalfEnded") and not halfs.get("secondHalfStarted"):
+        return True
+    return (status.get("reason") or {}).get("short") == "HT"
+
+
+def fmt_half_time(match):
+    lines = ["⏸️ <b>HALF-TIME</b>", f"<b>{score_line(match)}</b>"]
+    gs = goals(match)
+    if gs:
+        lines.append("")
+        for e in gs:
+            assist = e.get("assistInput")
+            lines.append(f"⚽ {minute(e)} {esc(e.get('nameStr'))} ({esc(team_name(match, e.get('isHome')))})"
+                         f"{goal_detail(e)}{' — assist: ' + esc(assist) if assist else ''}")
+    for e in red_cards(match):
+        lines.append(f"🟥 {minute(e)} {esc(e.get('nameStr'))} ({esc(team_name(match, e.get('isHome')))})")
+    return "\n".join(lines)
+
+
 def fmt_ruled_out(match, e):
     return "\n".join([
         "❌ <b>GOAL RULED OUT</b>",
@@ -354,6 +377,11 @@ def process_match(match, ms, now, dry_run=False):
         for key in vanished[:announced - total]:
             if send(fmt_ruled_out(match, ms["alerted"][key]), dry_run):
                 del ms["alerted"][key]
+
+    # Checked after goals so a goal right before the whistle is announced first
+    if not ms.get("halftime") and not status.get("finished") and is_half_time(match):
+        if send(fmt_half_time(match), dry_run):
+            ms["halftime"] = True
 
     if status.get("finished") and not ms["summary"]:
         ms.setdefault("finished_seen", now.isoformat())

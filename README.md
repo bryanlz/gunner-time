@@ -3,7 +3,7 @@
 A Telegram bot that messages you about every Arsenal men's first-team match, in all competitions:
 
 1. **Lineup**: the starting XI as a numbered list plus the subs, sent as soon as the official lineup is published (usually 60–90 min before kickoff).
-2. **Goal alerts** for either team, with the scorer, assist and new score.
+2. **Goal alerts** for either team, with the scorer, assist and new score, plus a **half-time update** with the score so far.
 3. **Red card alerts** naming the player.
 4. **Full-time report**: final score, every goal with its assist, red cards and xG, sent as one message once xG is available. If xG hasn't appeared within 30 minutes it's sent without it.
 
