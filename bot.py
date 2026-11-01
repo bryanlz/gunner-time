@@ -31,6 +31,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 # GitHub's scheduled runs, which can start 10-30+ minutes late.
 LINEUP_WINDOW = timedelta(hours=3)       # start following a match this long before kickoff
 XG_WAIT_LIMIT = timedelta(minutes=30)    # after full time, wait at most this long for xG before sending anyway
+ASSIST_WAIT = timedelta(minutes=3)       # hold a goal alert this long for FotMob to add the assist (penalties and
+                                         # own goals have none, so they're sent straight away)
 PREMATCH_POLL = 60                       # seconds between checks while waiting for the lineup
 LIVE_POLL = 30                           # seconds between checks during the match
 MAX_RUNTIME = int(5.5 * 3600)            # one run's limit; GitHub stops jobs at 6 hours
@@ -347,6 +349,16 @@ def match_state(state, match_id):
 
 # ---------- Core logic ----------
 
+def assist_settled(e, ms, key, now, finished):
+    """True once a goal can be announced: its assist is known, it can't have one, or we've waited long enough."""
+    if e.get("assistInput") or e.get("ownGoal") or finished:
+        return True
+    if (e.get("goalDescription") or "").lower() == "penalty":
+        return True
+    first_seen = ms.setdefault("pending", {}).setdefault(key, now.isoformat())
+    return now - datetime.fromisoformat(first_seen) >= ASSIST_WAIT
+
+
 def process_match(match, ms, now, dry_run=False):
     """Send whatever is new for this match. Mutates ms (this match's state). Returns True once fully done."""
     status = match["header"]["status"]
@@ -368,9 +380,15 @@ def process_match(match, ms, now, dry_run=False):
     for e in red_cards(match):
         current[card_key(e)] = e
 
+    holding = False  # a goal is waiting for its assist; later goals wait too so alerts stay in order
     for key, e in current.items():
         if key in ms["alerted"]:
             continue
+        if key.startswith("goal"):
+            settled = assist_settled(e, ms, key, now, status.get("finished"))
+            if holding or not settled:
+                holding = True
+                continue
         record = {"nameStr": e.get("nameStr"), "time": e.get("time"), "overloadTime": e.get("overloadTime"),
                   "isHome": e.get("isHome"), "player": (e.get("player") or {}).get("id"),
                   "newScore": e.get("newScore"), "assist": e.get("assistInput")}
@@ -388,8 +406,9 @@ def process_match(match, ms, now, dry_run=False):
         msg = fmt_goal(match, e) if key.startswith("goal") else fmt_red(match, e)
         if send(msg, dry_run):
             ms["alerted"][key] = record
+    ms["pending"] = {k: v for k, v in ms.get("pending", {}).items() if k in current and k not in ms["alerted"]}
 
-    # FotMob often adds the assist a minute or so after the goal; send it as a follow-up
+    # Backup for an assist FotMob adds after ASSIST_WAIT has run out: send it as a follow-up
     for key, e in current.items():
         record = ms["alerted"].get(key)
         assist = e.get("assistInput")
@@ -408,7 +427,7 @@ def process_match(match, ms, now, dry_run=False):
                 del ms["alerted"][key]
 
     # Checked after goals so a goal right before the whistle is announced first
-    if not ms.get("halftime") and not status.get("finished") and is_half_time(match):
+    if not ms.get("halftime") and not holding and not status.get("finished") and is_half_time(match):
         if send(fmt_half_time(match), dry_run):
             ms["halftime"] = True
 
