@@ -239,6 +239,23 @@ def fmt_red(match, e):
     ])
 
 
+def fmt_assist_update(match, e):
+    return "\n".join([
+        "🅰️ <b>Assist update</b>",
+        f"{esc(e.get('assistInput'))} set up {esc(e.get('nameStr'))}'s goal ({minute(e)}, "
+        f"{esc(team_name(match, e.get('isHome')))})",
+    ])
+
+
+def fmt_scorer_change(match, e, old):
+    assist = e.get("assistInput")
+    return "\n".join([
+        "✏️ <b>Goal update</b>",
+        f"The {minute(e)} goal is now credited to {esc(e.get('nameStr'))} (was {esc(old.get('nameStr'))})",
+        f"Assist: {esc(assist) if assist else 'none'}",
+    ])
+
+
 def is_half_time(match):
     """True while the first half is over and the second hasn't started."""
     status = match["header"]["status"]
@@ -356,17 +373,29 @@ def process_match(match, ms, now, dry_run=False):
             continue
         record = {"nameStr": e.get("nameStr"), "time": e.get("time"), "overloadTime": e.get("overloadTime"),
                   "isHome": e.get("isHome"), "player": (e.get("player") or {}).get("id"),
-                  "newScore": e.get("newScore")}
-        # FotMob sometimes corrects a goal's minute, which changes its key; don't announce it twice
+                  "newScore": e.get("newScore"), "assist": e.get("assistInput")}
+        # FotMob sometimes corrects a goal's minute or scorer, which changes its key; don't announce it twice
         renamed = [k for k, r in ms["alerted"].items() if k.startswith("goal") and k not in current
-                   and r.get("player") == record["player"] and r.get("newScore") == record["newScore"]]
+                   and r.get("newScore") == record["newScore"]]
         if key.startswith("goal") and renamed:
-            del ms["alerted"][renamed[0]]
+            old = ms["alerted"].pop(renamed[0])
+            if old.get("player") != record["player"] and not send(fmt_scorer_change(match, e, old), dry_run):
+                ms["alerted"][renamed[0]] = old
+                continue
+            record["assist"] = old.get("assist")  # so the assist check below still notices a new assist
             ms["alerted"][key] = record
             continue
         msg = fmt_goal(match, e) if key.startswith("goal") else fmt_red(match, e)
         if send(msg, dry_run):
             ms["alerted"][key] = record
+
+    # FotMob often adds the assist a minute or so after the goal; send it as a follow-up
+    for key, e in current.items():
+        record = ms["alerted"].get(key)
+        assist = e.get("assistInput")
+        if key.startswith("goal") and record and assist and assist != record.get("assist"):
+            if send(fmt_assist_update(match, e), dry_run):
+                record["assist"] = assist
 
     # A goal we announced that has vanished from the feed, with the score dropping, was overturned (usually VAR)
     home, away = teams(match)
